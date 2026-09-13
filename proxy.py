@@ -29,9 +29,13 @@ import argparse
 import http.client
 import json
 import os
+import random
 import signal
+import socket
 import ssl
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -53,6 +57,84 @@ REMOTE_TIMEOUT = 600
 
 # 允许的最大请求体（字节），超过则返回 413
 MAX_REQUEST_BODY = 256 * 1024 * 1024
+
+# ------------------------------------------------------------
+# 抗瞬时故障：DNS 缓存 + 建连重试
+#
+# cloudflared 隧道域名解析偶尔会抖动（Errno -3 Temporary failure in
+# name resolution）。每个请求都重新解析一次，抖一下就把请求打成 502。
+# 这里做两件事：
+#   1) 解析结果缓存 DNS_CACHE_TTL 秒，绝大多数请求不再查 DNS；
+#   2) 建连/发送阶段失败时退避重试（请求体已在内存里，重发是安全的）。
+# 失败时会主动丢弃该 host 的缓存，下一次重试重新解析。
+# ------------------------------------------------------------
+UPSTREAM_RETRIES = int(os.environ.get("PROXY_UPSTREAM_RETRIES", "3"))
+RETRY_BACKOFF = 0.3        # 秒；按 2^n 递增，并叠加随机抖动
+DNS_CACHE_TTL = float(os.environ.get("PROXY_DNS_TTL", "60"))
+
+_dns_cache = {}
+_dns_lock = threading.Lock()
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _cached_getaddrinfo(host, port, *args, **kwargs):
+    key = (host, port, args, tuple(sorted(kwargs.items())))
+    now = time.time()
+    with _dns_lock:
+        hit = _dns_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    infos = _real_getaddrinfo(host, port, *args, **kwargs)
+    with _dns_lock:
+        _dns_cache[key] = (now + DNS_CACHE_TTL, infos)
+    return infos
+
+
+def _drop_dns_cache(host):
+    with _dns_lock:
+        for key in [k for k in _dns_cache if k[0] == host]:
+            del _dns_cache[key]
+
+
+def install_dns_cache():
+    """Route this process' name lookups through the TTL cache above."""
+    socket.getaddrinfo = _cached_getaddrinfo
+
+
+def open_upstream(command, path, body, headers):
+    """Connect to the remote and send, retrying transient failures.
+
+    Safe to retry because the whole client body is already buffered and we
+    have not received any upstream response yet. Certificate errors are not
+    retried (they will not heal).
+    """
+    last = None
+    for attempt in range(UPSTREAM_RETRIES):
+        conn = http.client.HTTPSConnection(
+            REMOTE.netloc, timeout=REMOTE_TIMEOUT, context=SSL_CONTEXT)
+        try:
+            conn.request(command, path, body=body, headers=headers)
+            return conn
+        except ssl.SSLCertVerificationError:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        except (OSError, http.client.HTTPException) as e:
+            last = e
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _drop_dns_cache(REMOTE.hostname)
+            if attempt + 1 < UPSTREAM_RETRIES:
+                delay = RETRY_BACKOFF * (2 ** attempt)
+                print(f"[proxy] upstream connect failed ({e}); retry "
+                      f"{attempt + 1}/{UPSTREAM_RETRIES - 1} in "
+                      f"{delay:.1f}s", file=sys.stderr, flush=True)
+                time.sleep(delay + random.uniform(0, delay))
+    raise last
 
 
 # ============================================================
@@ -282,28 +364,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 连接 Kaggle / Cloudflare
         # ----------------------------------------------------
 
+        conn = None
         try:
-            conn = http.client.HTTPSConnection(
-                REMOTE.netloc,
-                timeout=REMOTE_TIMEOUT,
-                context=SSL_CONTEXT,
-            )
-
-            conn.request(
-                self.command,
-                upstream_path,
-                body=body,
-                headers=headers,
-            )
-
+            conn = open_upstream(self.command, upstream_path, body, headers)
             response = conn.getresponse()
 
         except Exception as e:
             print(
-                f"[proxy] upstream connection failed: {e}",
+                f"[proxy] upstream connection failed after "
+                f"{UPSTREAM_RETRIES} attempt(s): {e}",
                 file=sys.stderr,
                 flush=True,
             )
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self.send_error(502, "Upstream connection failed")
             return
 
@@ -445,6 +522,8 @@ def main():
     # 远端路径前缀，例如 REMOTE_URL=https://host/v1 时为 "/v1"
     REMOTE_PATH_PREFIX = REMOTE.path.rstrip("/")
 
+    install_dns_cache()
+
     print()
     print("=" * 62)
     print("Kaggle TPU Reverse Proxy")
@@ -454,6 +533,8 @@ def main():
     print(f"        model = {REMOTE_MODEL or '(未指定，原样透传)'}"
           "  (客户端随便填/不填，本代理自动替换)")
     print(f"REMOTE  {REMOTE_URL}   (每次会话会变，客户端不用管)")
+    print(f"        retry = {UPSTREAM_RETRIES} attempts, "
+          f"DNS cache = {DNS_CACHE_TTL:g}s")
     print("=" * 62)
     print(flush=True)  # stdout may be a log file; don't sit in the buffer
 
