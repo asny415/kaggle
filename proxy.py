@@ -52,29 +52,39 @@ LOCAL_PORT = 9000
 # 所以客户端配置永远不用随远端变化。
 LOCAL_API_KEY = "sk-kaggle-tpu-local"
 
-# 远端连接超时时间（秒）
+# 远端读超时（秒）：生成可能要几分钟，读阶段给足时间
 REMOTE_TIMEOUT = 600
+
+# 建连 + TLS 握手超时（秒）：必须短。以前和读超时共用一个 600s，握手一旦
+# 卡住要等 10 分钟才重试（日志里的 "handshake operation timed out"）。
+CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "15"))
 
 # 允许的最大请求体（字节），超过则返回 413
 MAX_REQUEST_BODY = 256 * 1024 * 1024
 
 # ------------------------------------------------------------
-# 抗瞬时故障：DNS 缓存 + 建连重试
+# 抗瞬时故障：DNS 缓存 + 建连重试 + 连接复用
 #
-# cloudflared 隧道域名解析偶尔会抖动（Errno -3 Temporary failure in
-# name resolution）。每个请求都重新解析一次，抖一下就把请求打成 502。
-# 这里做两件事：
-#   1) 解析结果缓存 DNS_CACHE_TTL 秒，绝大多数请求不再查 DNS；
-#   2) 建连/发送阶段失败时退避重试（请求体已在内存里，重发是安全的）。
-# 失败时会主动丢弃该 host 的缓存，下一次重试重新解析。
+# cloudflared 隧道域名偶尔解析抖动（Errno -3），新建的 TLS 连接也偶尔握手
+# 超时 / 被 reset（Errno 104）——每个请求都新建连接就会频繁踩到。所以：
+#   1) DNS 解析结果缓存 DNS_CACHE_TTL 秒；
+#   2) 建连/发送失败退避重试（请求体已在内存里，重发是安全的）；
+#   3) 响应读完且连接可复用时放回池里 —— 后续请求省掉 DNS+TCP+TLS 握手，
+#      这是减少 handshake/reset 错误的关键；
+#   4) 建连用短超时，读响应用长超时。
 # ------------------------------------------------------------
 UPSTREAM_RETRIES = int(os.environ.get("PROXY_UPSTREAM_RETRIES", "3"))
 RETRY_BACKOFF = 0.3        # 秒；按 2^n 递增，并叠加随机抖动
 DNS_CACHE_TTL = float(os.environ.get("PROXY_DNS_TTL", "60"))
+KEEPALIVE_MAX = int(os.environ.get("PROXY_KEEPALIVE_MAX", "4"))
+KEEPALIVE_TTL = float(os.environ.get("PROXY_KEEPALIVE_TTL", "15"))
 
 _dns_cache = {}
 _dns_lock = threading.Lock()
 _real_getaddrinfo = socket.getaddrinfo
+
+_pool = []                 # [(conn, idle_since)]
+_pool_lock = threading.Lock()
 
 
 def _cached_getaddrinfo(host, port, *args, **kwargs):
@@ -101,39 +111,133 @@ def install_dns_cache():
     socket.getaddrinfo = _cached_getaddrinfo
 
 
-def open_upstream(command, path, body, headers):
-    """Connect to the remote and send, retrying transient failures.
+def _safe_close(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
 
-    Safe to retry because the whole client body is already buffered and we
-    have not received any upstream response yet. Certificate errors are not
-    retried (they will not heal).
+
+def _tune_socket(sock):
+    """TCP keepalive：更快发现死连接，也保住 NAT/防火墙映射。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10),
+                            ("TCP_KEEPCNT", 3)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError:
+        pass
+
+
+def _new_conn():
+    """DNS + TCP + TLS 全用短超时；连上后切成读响应用的长超时。"""
+    conn = http.client.HTTPSConnection(
+        REMOTE.netloc, timeout=CONNECT_TIMEOUT, context=SSL_CONTEXT)
+    try:
+        conn.connect()
+        if conn.sock is not None:
+            _tune_socket(conn.sock)
+            conn.sock.settimeout(REMOTE_TIMEOUT)
+        return conn
+    except Exception:
+        _safe_close(conn)
+        raise
+
+
+def _pool_get():
+    while True:
+        with _pool_lock:
+            if not _pool:
+                return None
+            conn, idle_since = _pool.pop()
+        if time.time() - idle_since > KEEPALIVE_TTL or conn.sock is None:
+            _safe_close(conn)
+            continue
+        return conn
+
+
+def _pool_put(conn):
+    if conn.sock is None:
+        return
+    with _pool_lock:
+        if len(_pool) >= KEEPALIVE_MAX:
+            overflow = conn
+        else:
+            _pool.append((conn, time.time()))
+            overflow = None
+    if overflow is not None:
+        _safe_close(overflow)
+
+
+def close_pool():
+    with _pool_lock:
+        conns, _pool[:] = list(_pool), []
+    for conn, _ in conns:
+        _safe_close(conn)
+
+
+def _retry_pause(attempt, err):
+    delay = RETRY_BACKOFF * (2 ** attempt)
+    print(f"[proxy] upstream failure ({err}); retry {attempt + 1}/"
+          f"{UPSTREAM_RETRIES - 1} in {delay:.1f}s", file=sys.stderr, flush=True)
+    time.sleep(delay + random.uniform(0, delay))
+
+
+def upstream_exchange(command, path, body, headers):
+    """发送请求并取回响应，透明处理瞬时故障。返回 (conn, response)。
+
+    - 建连/发送失败：重试（请求体已在内存里，安全）。
+    - 复用连接上失败：它在空闲时已被对端关掉，换新连接重试是安全的。
+    - 新连接在 getresponse 阶段失败：不重发，避免重复生成。
+    - 证书校验失败：直接抛，不重试。
     """
     last = None
     for attempt in range(UPSTREAM_RETRIES):
-        conn = http.client.HTTPSConnection(
-            REMOTE.netloc, timeout=REMOTE_TIMEOUT, context=SSL_CONTEXT)
+        conn = _pool_get()
+        reused = conn is not None
+        if conn is None:
+            try:
+                conn = _new_conn()
+            except ssl.SSLCertVerificationError:
+                raise
+            except (OSError, http.client.HTTPException) as e:
+                last = e
+                _drop_dns_cache(REMOTE.hostname)
+                if attempt + 1 < UPSTREAM_RETRIES:
+                    _retry_pause(attempt, e)
+                    continue
+                raise
         try:
             conn.request(command, path, body=body, headers=headers)
-            return conn
         except ssl.SSLCertVerificationError:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _safe_close(conn)
             raise
         except (OSError, http.client.HTTPException) as e:
+            _safe_close(conn)
             last = e
-            try:
-                conn.close()
-            except Exception:
-                pass
             _drop_dns_cache(REMOTE.hostname)
+            if reused:
+                close_pool()          # 别再拿到池里其它同样过期的连接
             if attempt + 1 < UPSTREAM_RETRIES:
-                delay = RETRY_BACKOFF * (2 ** attempt)
-                print(f"[proxy] upstream connect failed ({e}); retry "
-                      f"{attempt + 1}/{UPSTREAM_RETRIES - 1} in "
-                      f"{delay:.1f}s", file=sys.stderr, flush=True)
-                time.sleep(delay + random.uniform(0, delay))
+                _retry_pause(attempt, e)
+                continue
+            raise
+        try:
+            return conn, conn.getresponse()
+        except ssl.SSLCertVerificationError:
+            _safe_close(conn)
+            raise
+        except (OSError, http.client.HTTPException) as e:
+            _safe_close(conn)
+            last = e
+            if reused and attempt + 1 < UPSTREAM_RETRIES:
+                print("[proxy] reused keep-alive connection was closed by the "
+                      "peer; retrying on a fresh one", file=sys.stderr,
+                      flush=True)
+                close_pool()
+                continue
+            raise
     raise last
 
 
@@ -366,8 +470,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         conn = None
         try:
-            conn = open_upstream(self.command, upstream_path, body, headers)
-            response = conn.getresponse()
+            conn, response = upstream_exchange(
+                self.command, upstream_path, body, headers)
 
         except Exception as e:
             print(
@@ -377,10 +481,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 flush=True,
             )
             if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                _safe_close(conn)
             self.send_error(502, "Upstream connection failed")
             return
 
@@ -439,6 +540,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # streaming copy
         # ----------------------------------------------------
 
+        reuse = False
         try:
             while True:
                 chunk = response.read(64 * 1024)
@@ -446,8 +548,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+            # 响应被完整读完、且上游没说 close -> 连接可以复用
+            reuse = not response.will_close
 
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 客户端提前断开，上游响应没读完，不能复用
             pass
 
         except Exception as e:
@@ -458,7 +563,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
 
         finally:
-            conn.close()
+            if reuse and conn is not None and conn.sock is not None:
+                _pool_put(conn)     # keep-alive：下次请求省掉 DNS+TCP+TLS
+            elif conn is not None:
+                _safe_close(conn)
             self.close_connection = True
 
 
@@ -534,7 +642,9 @@ def main():
           "  (客户端随便填/不填，本代理自动替换)")
     print(f"REMOTE  {REMOTE_URL}   (每次会话会变，客户端不用管)")
     print(f"        retry = {UPSTREAM_RETRIES} attempts, "
-          f"DNS cache = {DNS_CACHE_TTL:g}s")
+          f"connect timeout = {CONNECT_TIMEOUT:g}s")
+    print(f"        DNS cache = {DNS_CACHE_TTL:g}s, keep-alive pool = "
+          f"{KEEPALIVE_MAX} conns / {KEEPALIVE_TTL:g}s idle")
     print("=" * 62)
     print(flush=True)  # stdout may be a log file; don't sit in the buffer
 
@@ -568,6 +678,7 @@ def main():
     finally:
 
         server.server_close()
+        close_pool()
 
 
 if __name__ == "__main__":
