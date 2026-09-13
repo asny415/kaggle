@@ -5,20 +5,32 @@ kaggle-tpu-lab launcher — serve Qwen3.8-27B on a free Kaggle TPU from your ter
     python launch.py serve                 # push the kernel and watch it come up
     python launch.py serve --reasoning-effort medium --mtp 3
     python launch.py status                # one-shot status + recent events
-    python launch.py stop                  # kill the TPU session
+    python launch.py stop                  # kill the TPU session (and the local proxy)
+
+When the endpoint goes live (seen by `serve` or `status`), proxy.py starts
+automatically on the fixed local address http://127.0.0.1:9000 and injects the
+API key. Point your clients at that local URL once and forget about the
+tunnel: every new session gets a new URL/key, but the local address stays the
+same — a leftover proxy is found and replaced (logs go to
+~/.kaggle-tpu-lab-proxy.log). It keeps running after you detach; `stop`
+terminates it together with the kernel.
 
 Requires the Kaggle CLI, authenticated:  pip install kaggle   (see README).
 Only the Python standard library is used here.
 """
 import argparse
 import json
+import os
 import re
 import secrets
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -26,6 +38,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
+PROXY_SCRIPT = HERE / "proxy.py"
+PROXY_PID_FILE = Path.home() / ".kaggle-tpu-lab-proxy.pid"
+PROXY_LOG_FILE = Path.home() / ".kaggle-tpu-lab-proxy.log"
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 9000
+
+_proxy_proc = None  # Popen handle of proxy.py, when started from this process
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
@@ -81,6 +100,261 @@ def kaggle_username(cli_arg):
     if m and m.group(1) not in ("None", "-"):
         return m.group(1).strip("'\"")
     sys.exit("Could not detect your Kaggle username — pass it with --user <name>.")
+
+
+def _port_in_use(host, port):
+    """True if something is actively listening on host:port.
+
+    SO_REUSEADDR keeps lingering TIME_WAIT sockets (left by clients that just
+    disconnected) from looking like an active listener.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return False
+        except OSError:
+            return True
+
+
+def _pid_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+
+
+def _cmdline_str(pid):
+    return " ".join(_pid_cmdline(pid))[:80] or "unknown command"
+
+
+def _is_proxy_process(pid):
+    """True if pid is a python process running this directory's proxy.py."""
+    for arg in _pid_cmdline(pid)[1:]:
+        if not arg.endswith(PROXY_SCRIPT.name):
+            continue
+        p = Path(arg)
+        if p.is_absolute():
+            if p.resolve() == PROXY_SCRIPT:
+                return True
+        else:
+            try:
+                cwd = Path(f"/proc/{pid}/cwd").resolve()
+            except OSError:
+                continue
+            if (cwd / p).resolve() == PROXY_SCRIPT:
+                return True
+    return False
+
+
+def _listening_pid(host, port):
+    """Pid of the process listening on host:port, or None.
+
+    Linux-only best effort (reads /proc); returns None if it cannot tell.
+    """
+    try:
+        addr = "%08X" % struct.unpack("<I", socket.inet_aton(host))[0]
+    except OSError:
+        return None
+    want = f"{addr}:{port:04X}"
+    try:
+        lines = Path("/proc/net/tcp").read_text().splitlines()[1:]
+    except OSError:
+        return None
+    inode = None
+    for line in lines:
+        f = line.split()
+        # sl local_address rem_address st tx_queue:rx_queue ... inode
+        if len(f) > 9 and f[1] == want and f[3] == "0A":  # 0A = LISTEN
+            inode = f[9]
+            break
+    if inode is None:
+        return None
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fds = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(fd) == f"socket:[{inode}]":
+                    return int(entry.name)
+            except OSError:
+                continue
+    return None
+
+
+def _read_proxy_pidfile():
+    """(pid, endpoint) recorded in the pidfile, or (None, None)."""
+    try:
+        data = json.loads(PROXY_PID_FILE.read_text())
+        return int(data["pid"]), data.get("endpoint")
+    except Exception:
+        return None, None
+
+
+def proxy_alive_pid():
+    """Pid of a running proxy.py: this process' child, whatever is listening
+    on the fixed port, or the pid from the pidfile — else None."""
+    global _proxy_proc
+    if _proxy_proc is not None and _proxy_proc.poll() is None:
+        return _proxy_proc.pid
+    pid = _listening_pid(PROXY_HOST, PROXY_PORT)
+    if pid is not None and _is_proxy_process(pid):
+        return pid
+    pid, _ = _read_proxy_pidfile()
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+            if _is_proxy_process(pid):
+                return pid
+        except OSError:
+            pass
+    return None
+
+
+def _kill_proxy_pid(pid):
+    """Stop one proxy.py process and wait for the fixed port to come free."""
+    global _proxy_proc
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    if _proxy_proc is not None and _proxy_proc.pid == pid:
+        try:
+            _proxy_proc.wait(timeout=5)
+        except Exception:
+            pass
+        _proxy_proc = None
+    for _ in range(30):
+        if not _port_in_use(PROXY_HOST, PROXY_PORT):
+            break
+        time.sleep(0.1)
+    try:
+        PROXY_PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def start_proxy(endpoint, api_key=None):
+    """Make sure proxy.py serves the live endpoint on the fixed local port.
+
+    Called every time `serve`/`status` sees the endpoint go live. Any proxy
+    left over from an earlier run — including one started by hand — is
+    identified and replaced, so the local URL (and the client config) never
+    changes even though the tunnel URL and API key do.
+
+    The endpoint goes on the command line; the API key is handed to the child
+    through the REMOTE_API_KEY environment variable, so it never shows up in
+    `ps` output (see proxy.py).
+    """
+    global _proxy_proc
+
+    pid = _listening_pid(PROXY_HOST, PROXY_PORT)
+    if pid is not None:
+        if not _is_proxy_process(pid):
+            say(f"WARNING: port {PROXY_PORT} is held by pid {pid} "
+                f"({_cmdline_str(pid)}) — not starting the local proxy. Free "
+                "the port and re-run.")
+            return
+        saved_pid, saved_endpoint = _read_proxy_pidfile()
+        if saved_pid == pid and saved_endpoint == endpoint:
+            say(f"Local proxy already up on http://{PROXY_HOST}:{PROXY_PORT} "
+                f"(pid {pid})")
+            return
+        say(f"Replacing the local proxy on port {PROXY_PORT} "
+            f"({saved_endpoint or 'unknown endpoint'}  ->  {endpoint})")
+        _kill_proxy_pid(pid)
+    elif _port_in_use(PROXY_HOST, PROXY_PORT):
+        say(f"WARNING: port {PROXY_PORT} is already in use and its owner could "
+            "not be identified — not starting the local proxy.")
+        return
+
+    if not api_key:
+        try:
+            api_key = json.loads(STATE_FILE.read_text()).get("api_key", "")
+        except Exception:
+            api_key = ""
+    if not api_key:
+        say("WARNING: no API key available — skipping the local proxy.")
+        return
+    if not PROXY_SCRIPT.exists():
+        say(f"WARNING: {PROXY_SCRIPT.name} not found next to launch.py — "
+            "skipping the local proxy.")
+        return
+
+    # Remember the live endpoint: ntfy drops the ready event after ~12 h, and
+    # `status` needs it to bring the proxy back up later in the session.
+    update_state(endpoint=endpoint, api_key=api_key)
+
+    say(f"Starting local proxy  http://{PROXY_HOST}:{PROXY_PORT}  ->  {endpoint}")
+    log = None
+    try:
+        log = open(PROXY_LOG_FILE, "w")
+    except OSError:
+        pass
+    env = {**os.environ, "REMOTE_API_KEY": api_key}
+    _proxy_proc = subprocess.Popen(
+        [sys.executable, "-u", str(PROXY_SCRIPT),  # -u: logs reach the file now
+         "--remote-url", endpoint,
+         "--host", PROXY_HOST, "--port", str(PROXY_PORT)],
+        env=env,
+        stdout=log if log is not None else subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,  # keep serving after we detach / Ctrl-C / exit
+    )
+    if log is not None:
+        log.close()
+        say(f"Proxy log: {PROXY_LOG_FILE}")
+    try:
+        PROXY_PID_FILE.write_text(json.dumps(
+            {"pid": _proxy_proc.pid, "endpoint": endpoint}))
+    except OSError:
+        pass
+
+    # Confirm it really bound the port (bad URL/key dies here).
+    for _ in range(20):
+        if _listening_pid(PROXY_HOST, PROXY_PORT) == _proxy_proc.pid:
+            break
+        if _proxy_proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    if _listening_pid(PROXY_HOST, PROXY_PORT) == _proxy_proc.pid:
+        say(f"Local proxy is up on http://{PROXY_HOST}:{PROXY_PORT} "
+            f"(pid {_proxy_proc.pid})")
+    else:
+        say(f"WARNING: the local proxy did not come up — see {PROXY_LOG_FILE}.")
+
+
+def stop_proxy():
+    """Terminate the local proxy, wherever it came from, if it is running."""
+    pid = proxy_alive_pid()
+    if pid is None:
+        return
+    _kill_proxy_pid(pid)
+    say(f"Local proxy stopped (pid {pid}).")
+
+
+def endpoint_alive(endpoint, api_key, timeout=8):
+    """Best-effort probe: does the tunnel answer right now?
+
+    ntfy keeps messages for ~12 h, so by the time `status` runs the `ready`
+    event may be gone; a live probe tells us whether the saved endpoint is
+    still worth proxying. Any sub-500 answer (even 401/404) means it is up.
+    """
+    req = urllib.request.Request(endpoint.rstrip("/") + "/models")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status < 500
+    except urllib.error.HTTPError as e:
+        return e.code < 500
+    except Exception:
+        return False
 
 
 def cmd_serve(args):
@@ -197,16 +471,19 @@ def render_event(ev):
         print(f"  API key  : {ev['api_key']}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
-        print("""
-Try it:
-  curl $BASE/chat/completions -H "Authorization: Bearer $KEY" \\
-    -H "Content-Type: application/json" -d '{
+        start_proxy(ev["endpoint"], ev.get("api_key"))
+        print(f"""
+Try it (via the local proxy — no API key needed):
+  curl http://{PROXY_HOST}:{PROXY_PORT}/chat/completions \\
+    -H "Content-Type: application/json" -d '{{
       "model": "qwen3.8-27b",
-      "messages": [{"role": "user", "content": "Hello!"}],
-      "chat_template_kwargs": {"reasoning_effort": "low"}
-    }'
+      "messages": [{{"role": "user", "content": "Hello!"}}],
+      "chat_template_kwargs": {{"reasoning_effort": "low"}}
+    }}'
 
-See the README for hooking this into Claude Code, Codex CLI, opencode, etc.
+Point clients at http://{PROXY_HOST}:{PROXY_PORT} — the proxy forwards to the
+tunnel and injects the API key. See the README for hooking this into Claude
+Code, Codex CLI, opencode, etc.
 """)
         say(f"The kernel keeps serving for up to {ev.get('keepalive_min', '?')} min. "
             "Ctrl-C here does NOT stop it; use `python launch.py stop`.")
@@ -235,26 +512,28 @@ def watch(kernel, topic):
                 seen_boot = True
                 render_event(ev)
                 if ev.get("phase") in ("failed", "auto-shutdown", "stopped"):
+                    stop_proxy()
                     return
             since = max(since, int(time.time()) - 1) if seen_boot else since
             r = kaggle("kernels", "status", kernel)
             out = (r.stdout or "") + (r.stderr or "")
-            m = re.search(r'"KernelWorkerStatus\.(\w+)"', out)
-            status = m.group(1) if m else "UNKNOWN"
+            status = _parse_kernel_status(out)
             if status != last_status:
                 if status == "QUEUED":
                     say("Kaggle: queued — waiting for a TPU v5e-8 slot...")
                 elif status == "RUNNING" and not seen_boot:
                     say("Kaggle: provisioning the VM and attaching datasets "
                         "(a few minutes)...")
-                elif status in ("ERROR", "CANCELACKNOWLEDGED", "COMPLETE"):
+                elif _kernel_ended(status):
                     say(f"Kernel finished with status {status}.")
+                    stop_proxy()
                     return
                 last_status = status
             time.sleep(30)
     except KeyboardInterrupt:
         say("Detached. The kernel keeps running — `python launch.py status` to "
-            "re-attach, `python launch.py stop` to kill it.")
+            "re-attach, `python launch.py stop` to kill it. The local proxy "
+            f"(if started) keeps serving at http://{PROXY_HOST}:{PROXY_PORT}.")
 
 
 def cmd_build_env(args):
@@ -297,21 +576,82 @@ def load_state():
     return json.loads(STATE_FILE.read_text())
 
 
+def update_state(**fields):
+    """Merge fields into the launch state file (best effort)."""
+    try:
+        st = json.loads(STATE_FILE.read_text())
+    except Exception:
+        st = {}
+    st.update({k: v for k, v in fields.items() if v is not None})
+    try:
+        STATE_FILE.write_text(json.dumps(st))
+    except OSError:
+        pass
+
+
+def _parse_kernel_status(out):
+    m = re.search(r'"KernelWorkerStatus\.(\w+)"', out)
+    return m.group(1) if m else "UNKNOWN"
+
+
+def _kernel_ended(status):
+    # Kaggle reports "CANCEL_ACKNOWLEDGED"; normalize before comparing.
+    return status.replace("_", "") in ("ERROR", "COMPLETE", "CANCELACKNOWLEDGED")
+
+
 def cmd_status(args):
     st = load_state()
     say(f"Kernel: {st['kernel']}")
     r = kaggle("kernels", "status", st["kernel"])
-    say(((r.stdout or "") + (r.stderr or "")).strip())
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode != 0 and "No module named kaggle" in out:
+        sys.exit(f"The Kaggle CLI is not importable by this Python:\n"
+                 f"  {sys.executable}\n"
+                 "Install it there, or run with an interpreter that has it, e.g.\n"
+                 f"  {HERE / '.venv' / 'bin' / 'python'} launch.py status -f")
+    say(out)
+    status = _parse_kernel_status(out)
+
     events = read_events(st["topic"], int(time.time()) - 24 * 3600)
-    for _, ev in events[-8:]:
+    tail = events[-8:]
+    for _, ev in tail:
         render_event(ev)
-    if any(ev.get("phase") == "ready" for _, ev in events):
-        say(f"API key: {st['api_key']}")
+
+    ready_ev = next((ev for _, ev in reversed(events)
+                     if ev.get("phase") == "ready"), None)
+    endpoint = api_key = None
+    if ready_ev:
+        endpoint = ready_ev["endpoint"]
+        api_key = ready_ev.get("api_key") or st.get("api_key")
+        if not any(ev.get("phase") == "ready" for _, ev in tail):
+            # Older than the last-8 replay above; start the proxy explicitly.
+            say(f"API key: {api_key}")
+            start_proxy(endpoint, api_key)
+    elif st.get("endpoint"):
+        # ntfy expired the ready event, but we remembered the endpoint when it
+        # first went live — use it if it still answers.
+        if endpoint_alive(st["endpoint"], st.get("api_key")):
+            endpoint = st["endpoint"]
+            api_key = st.get("api_key")
+            say(f"Endpoint (from saved state, ntfy event expired): {endpoint}")
+            start_proxy(endpoint, api_key)
+        else:
+            say(f"Saved endpoint {st['endpoint']} does not answer — that "
+                "session looks finished.")
+
+    if endpoint is None:
+        say("No live endpoint to proxy right now — start one with "
+            "`python launch.py serve`.")
+
     if args.follow:
-        watch(st["kernel"], st["topic"])
+        if endpoint is None and _kernel_ended(status):
+            say(f"Nothing to follow: kernel status is {status}.")
+        else:
+            watch(st["kernel"], st["topic"])
 
 
 def cmd_stop(args):
+    stop_proxy()
     st = load_state()
     say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
     p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
