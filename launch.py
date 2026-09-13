@@ -9,9 +9,11 @@ kaggle-tpu-lab launcher — serve Qwen3.8-27B on a free Kaggle TPU from your ter
 
 When the endpoint goes live (seen by `serve` or `status`), proxy.py starts
 automatically on the fixed local address http://127.0.0.1:9000 and injects the
-API key. Point your clients at that local URL once and forget about the
-tunnel: every new session gets a new URL/key, but the local address stays the
-same — a leftover proxy is found and replaced (logs go to
+current remote API key. Clients only ever need the fixed local contract —
+base_url http://127.0.0.1:9000/v1 and the fixed local key (or any key, or no
+key: the proxy ignores what clients send and substitutes the real remote key).
+Every new session gets a new remote URL/key, but the local address/key stay
+the same — a leftover proxy is found and replaced (logs go to
 ~/.kaggle-tpu-lab-proxy.log). It keeps running after you detach; `stop`
 terminates it together with the kernel.
 
@@ -43,6 +45,8 @@ PROXY_PID_FILE = Path.home() / ".kaggle-tpu-lab-proxy.pid"
 PROXY_LOG_FILE = Path.home() / ".kaggle-tpu-lab-proxy.log"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 9000
+# 客户端固定使用的本地 key（proxy 会忽略它，替换成远端真实 key）
+LOCAL_PROXY_KEY = "sk-kaggle-tpu-local"
 
 _proxy_proc = None  # Popen handle of proxy.py, when started from this process
 
@@ -188,12 +192,12 @@ def _listening_pid(host, port):
 
 
 def _read_proxy_pidfile():
-    """(pid, endpoint) recorded in the pidfile, or (None, None)."""
+    """(pid, endpoint, model) recorded in the pidfile, or (None, None, None)."""
     try:
         data = json.loads(PROXY_PID_FILE.read_text())
-        return int(data["pid"]), data.get("endpoint")
+        return int(data["pid"]), data.get("endpoint"), data.get("model")
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def proxy_alive_pid():
@@ -205,7 +209,7 @@ def proxy_alive_pid():
     pid = _listening_pid(PROXY_HOST, PROXY_PORT)
     if pid is not None and _is_proxy_process(pid):
         return pid
-    pid, _ = _read_proxy_pidfile()
+    pid, _, _ = _read_proxy_pidfile()
     if pid is not None:
         try:
             os.kill(pid, 0)
@@ -239,19 +243,29 @@ def _kill_proxy_pid(pid):
         pass
 
 
-def start_proxy(endpoint, api_key=None):
+def start_proxy(endpoint, api_key=None, model=None):
     """Make sure proxy.py serves the live endpoint on the fixed local port.
 
     Called every time `serve`/`status` sees the endpoint go live. Any proxy
     left over from an earlier run — including one started by hand — is
-    identified and replaced, so the local URL (and the client config) never
-    changes even though the tunnel URL and API key do.
+    identified and replaced, so the local URL and the client key/model never
+    change even though the remote URL / key / model do.
 
-    The endpoint goes on the command line; the API key is handed to the child
-    through the REMOTE_API_KEY environment variable, so it never shows up in
-    `ps` output (see proxy.py).
+    The endpoint and model go on the command line; the API key is handed to
+    the child through the REMOTE_API_KEY environment variable, so it never
+    shows up in `ps` output (see proxy.py).
     """
     global _proxy_proc
+
+    # Resolve key/model from the saved state first: the "already up" check
+    # below compares against them, and an unresolved None would force a
+    # pointless restart on every `status` call.
+    try:
+        st = json.loads(STATE_FILE.read_text())
+    except Exception:
+        st = {}
+    api_key = api_key or st.get("api_key", "")
+    model = model or st.get("model", "")
 
     pid = _listening_pid(PROXY_HOST, PROXY_PORT)
     if pid is not None:
@@ -260,8 +274,9 @@ def start_proxy(endpoint, api_key=None):
                 f"({_cmdline_str(pid)}) — not starting the local proxy. Free "
                 "the port and re-run.")
             return
-        saved_pid, saved_endpoint = _read_proxy_pidfile()
-        if saved_pid == pid and saved_endpoint == endpoint:
+        saved_pid, saved_endpoint, saved_model = _read_proxy_pidfile()
+        if (saved_pid == pid and saved_endpoint == endpoint
+                and saved_model == model):
             say(f"Local proxy already up on http://{PROXY_HOST}:{PROXY_PORT} "
                 f"(pid {pid})")
             return
@@ -274,11 +289,6 @@ def start_proxy(endpoint, api_key=None):
         return
 
     if not api_key:
-        try:
-            api_key = json.loads(STATE_FILE.read_text()).get("api_key", "")
-        except Exception:
-            api_key = ""
-    if not api_key:
         say("WARNING: no API key available — skipping the local proxy.")
         return
     if not PROXY_SCRIPT.exists():
@@ -286,9 +296,9 @@ def start_proxy(endpoint, api_key=None):
             "skipping the local proxy.")
         return
 
-    # Remember the live endpoint: ntfy drops the ready event after ~12 h, and
-    # `status` needs it to bring the proxy back up later in the session.
-    update_state(endpoint=endpoint, api_key=api_key)
+    # Remember the live endpoint/model: ntfy drops the ready event after ~12 h,
+    # and `status` needs them to bring the proxy back up later in the session.
+    update_state(endpoint=endpoint, api_key=api_key, model=model)
 
     say(f"Starting local proxy  http://{PROXY_HOST}:{PROXY_PORT}  ->  {endpoint}")
     log = None
@@ -296,11 +306,15 @@ def start_proxy(endpoint, api_key=None):
         log = open(PROXY_LOG_FILE, "w")
     except OSError:
         pass
+    argv = [sys.executable, "-u", str(PROXY_SCRIPT),  # -u: logs reach file now
+            "--remote-url", endpoint,
+            "--host", PROXY_HOST, "--port", str(PROXY_PORT),
+            "--local-api-key", LOCAL_PROXY_KEY]
+    if model:
+        argv += ["--remote-model", model]
     env = {**os.environ, "REMOTE_API_KEY": api_key}
     _proxy_proc = subprocess.Popen(
-        [sys.executable, "-u", str(PROXY_SCRIPT),  # -u: logs reach the file now
-         "--remote-url", endpoint,
-         "--host", PROXY_HOST, "--port", str(PROXY_PORT)],
+        argv,
         env=env,
         stdout=log if log is not None else subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
@@ -311,7 +325,7 @@ def start_proxy(endpoint, api_key=None):
         say(f"Proxy log: {PROXY_LOG_FILE}")
     try:
         PROXY_PID_FILE.write_text(json.dumps(
-            {"pid": _proxy_proc.pid, "endpoint": endpoint}))
+            {"pid": _proxy_proc.pid, "endpoint": endpoint, "model": model}))
     except OSError:
         pass
 
@@ -324,7 +338,8 @@ def start_proxy(endpoint, api_key=None):
         time.sleep(0.1)
     if _listening_pid(PROXY_HOST, PROXY_PORT) == _proxy_proc.pid:
         say(f"Local proxy is up on http://{PROXY_HOST}:{PROXY_PORT} "
-            f"(pid {_proxy_proc.pid})")
+            f"(pid {_proxy_proc.pid}"
+            + (f", model {model}" if model else "") + ")")
     else:
         say(f"WARNING: the local proxy did not come up — see {PROXY_LOG_FILE}.")
 
@@ -467,23 +482,35 @@ def render_event(ev):
     elif phase == "ready":
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
-        print(f"  base URL : {ev['endpoint']}")
-        print(f"  API key  : {ev['api_key']}")
-        print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
+        print(f"  remote   : {ev['endpoint']}   (每次会话都会变)")
+        print(f"  remote key: {ev['api_key']}")
+        print("-" * 66)
+        print(f"  local    : http://{PROXY_HOST}:{PROXY_PORT}/v1   "
+              "<- 客户端固定写这里")
+        print(f"  local key: {LOCAL_PROXY_KEY}   "
+              "(填它/随便填/不填都行，本地代理会忽略)")
+        print(f"  model    : {ev['model']}   "
+              "(客户端随便填/不填，本地代理自动替换)")
+        print(f"             context: {ev.get('max_model_len', '?')}")
         print("=" * 66)
-        start_proxy(ev["endpoint"], ev.get("api_key"))
+        start_proxy(ev["endpoint"], ev.get("api_key"), ev.get("model"))
         print(f"""
-Try it (via the local proxy — no API key needed):
-  curl http://{PROXY_HOST}:{PROXY_PORT}/chat/completions \\
+Try it (固定本地入口 + 固定本地 key，model 随便填，不需要知道远端值):
+  curl http://{PROXY_HOST}:{PROXY_PORT}/v1/chat/completions \\
+    -H "Authorization: Bearer {LOCAL_PROXY_KEY}" \\
     -H "Content-Type: application/json" -d '{{
-      "model": "qwen3.8-27b",
+      "model": "whatever",
       "messages": [{{"role": "user", "content": "Hello!"}}],
       "chat_template_kwargs": {{"reasoning_effort": "low"}}
     }}'
+  # model 填什么都不影响：proxy 会替换成远端真实 model
 
-Point clients at http://{PROXY_HOST}:{PROXY_PORT} — the proxy forwards to the
-tunnel and injects the API key. See the README for hooking this into Claude
-Code, Codex CLI, opencode, etc.
+客户端配置（Claude Code / Codex CLI / opencode 等）只写一次：
+  base_url = http://{PROXY_HOST}:{PROXY_PORT}/v1
+  api_key  = {LOCAL_PROXY_KEY}   （或任意值：本地代理忽略它，
+                                  并在转发时替换成上面的远端 key）
+  model    = {ev['model']}       （或任意值/留空：本地代理自动替换）
+远端 URL/key/model 每次会话都变，客户端无需改动。
 """)
         say(f"The kernel keeps serving for up to {ev.get('keepalive_min', '?')} min. "
             "Ctrl-C here does NOT stop it; use `python launch.py stop`.")
@@ -619,22 +646,24 @@ def cmd_status(args):
 
     ready_ev = next((ev for _, ev in reversed(events)
                      if ev.get("phase") == "ready"), None)
-    endpoint = api_key = None
+    endpoint = api_key = model = None
     if ready_ev:
         endpoint = ready_ev["endpoint"]
         api_key = ready_ev.get("api_key") or st.get("api_key")
+        model = ready_ev.get("model") or st.get("model")
         if not any(ev.get("phase") == "ready" for _, ev in tail):
             # Older than the last-8 replay above; start the proxy explicitly.
             say(f"API key: {api_key}")
-            start_proxy(endpoint, api_key)
+            start_proxy(endpoint, api_key, model)
     elif st.get("endpoint"):
         # ntfy expired the ready event, but we remembered the endpoint when it
         # first went live — use it if it still answers.
         if endpoint_alive(st["endpoint"], st.get("api_key")):
             endpoint = st["endpoint"]
             api_key = st.get("api_key")
+            model = st.get("model")
             say(f"Endpoint (from saved state, ntfy event expired): {endpoint}")
-            start_proxy(endpoint, api_key)
+            start_proxy(endpoint, api_key, model)
         else:
             say(f"Saved endpoint {st['endpoint']} does not answer — that "
                 "session looks finished.")

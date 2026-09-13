@@ -3,7 +3,16 @@
 Kaggle TPU Reverse Proxy
 
 把本地请求（默认 http://127.0.0.1:9000）转发到 Kaggle TPU 远端 endpoint，
-并自动注入远端 API key —— 客户端只需要知道本地地址。
+并自动注入远端 API key。
+
+契约（客户端永远只认这几个固定值，远端变化全部由本代理兜住）：
+    base_url = http://127.0.0.1:9000/v1
+    本地 key = sk-kaggle-tpu-local    （其实填什么、甚至不填都行）
+    model    = 随便填、甚至不填也行    （本代理会自动替换成远端真实 model）
+
+客户端传来的 Authorization 会被本代理忽略并替换成当前会话的真实远端 key；
+请求体 JSON 里的 "model" 也会被替换成真实远端 model —— 远端 URL / key / model
+变化时，客户端的配置写死一次就行。
 
 一般不需要手动运行：`python launch.py serve` / `status` 发现 endpoint 就绪
 后会自动以正确参数启动本文件。手动运行示例：
@@ -18,6 +27,7 @@ Kaggle TPU Reverse Proxy
 
 import argparse
 import http.client
+import json
 import os
 import signal
 import ssl
@@ -29,9 +39,14 @@ from urllib.parse import urlsplit
 # 通常不需要改这里。
 DEFAULT_REMOTE_URL = "https://toner-shopper-feelings-ending.trycloudflare.com"
 
-# 本地监听地址
+# 本地固定入口：客户端永远只认这个地址，远端 URL 每次变都无所谓
 LOCAL_HOST = "127.0.0.1"
 LOCAL_PORT = 9000
+
+# 本地固定 key：客户端填它 / 随便填 / 不填都行。
+# 本文件一律忽略客户端传来的 Authorization，转发时替换成远端真实 key，
+# 所以客户端配置永远不用随远端变化。
+LOCAL_API_KEY = "sk-kaggle-tpu-local"
 
 # 远端连接超时时间（秒）
 REMOTE_TIMEOUT = 600
@@ -47,6 +62,7 @@ MAX_REQUEST_BODY = 256 * 1024 * 1024
 # 运行时配置：由 main() 根据命令行参数 / 环境变量填充
 REMOTE_URL = ""
 REMOTE_API_KEY = ""
+REMOTE_MODEL = ""          # 当前会话真实 model；客户端填什么都替换成它
 REMOTE = None
 REMOTE_PATH_PREFIX = ""
 
@@ -71,6 +87,25 @@ def build_upstream_path(client_path):
         return client_path
 
     return REMOTE_PATH_PREFIX + client_path
+
+
+def apply_model(body):
+    """把请求体 JSON 里的 "model" 换成远端真实 model（客户端不用管）。
+
+    只对看起来像推理请求的 JSON 对象动手，其它 body 原样透传。
+    """
+    if not REMOTE_MODEL or not body:
+        return body
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(obj, dict):
+        return body
+    if not ({"model", "messages", "prompt", "input"} & set(obj)):
+        return body
+    obj["model"] = REMOTE_MODEL
+    return json.dumps(obj, ensure_ascii=False).encode()
 
 
 class BodyTooLarge(Exception):
@@ -201,6 +236,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except ValueError as e:
             self.send_error(400, f"Bad request body: {e}")
             return
+
+        # 客户端 model 字段统一替换成远端真实 model（写死一次配置即可）
+        body = apply_model(body)
 
         # ----------------------------------------------------
         # 构造转发 headers
@@ -349,7 +387,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main():
 
-    global REMOTE_URL, REMOTE_API_KEY, REMOTE, REMOTE_PATH_PREFIX
+    global REMOTE_URL, REMOTE_API_KEY, REMOTE_MODEL, REMOTE, REMOTE_PATH_PREFIX
 
     ap = argparse.ArgumentParser(
         description="Reverse proxy: local port -> Kaggle TPU endpoint, "
@@ -366,6 +404,12 @@ def main():
         help="remote API key (or set the REMOTE_API_KEY environment variable)",
     )
     ap.add_argument(
+        "--remote-model",
+        default=os.environ.get("REMOTE_MODEL", ""),
+        help="remote model name injected into request bodies (or set "
+             "REMOTE_MODEL); clients may send anything",
+    )
+    ap.add_argument(
         "--host", default=LOCAL_HOST,
         help="local bind address (default: %(default)s)",
     )
@@ -373,10 +417,16 @@ def main():
         "--port", type=int, default=LOCAL_PORT,
         help="local port (default: %(default)s)",
     )
+    ap.add_argument(
+        "--local-api-key", default=LOCAL_API_KEY,
+        help="fixed key advertised to clients; any client key is accepted "
+             "(default: %(default)s)",
+    )
     args = ap.parse_args()
 
     REMOTE_URL = normalize_remote_url(args.remote_url)
     REMOTE_API_KEY = args.remote_api_key
+    REMOTE_MODEL = args.remote_model
 
     REMOTE = urlsplit(REMOTE_URL)
 
@@ -396,12 +446,15 @@ def main():
     REMOTE_PATH_PREFIX = REMOTE.path.rstrip("/")
 
     print()
-    print("=" * 60)
+    print("=" * 62)
     print("Kaggle TPU Reverse Proxy")
-    print("=" * 60)
-    print(f"Local : http://{args.host}:{args.port}")
-    print(f"Remote: {REMOTE_URL}")
-    print("=" * 60)
+    print("=" * 62)
+    print(f"LOCAL   http://{args.host}:{args.port}/v1   <- 客户端固定写这里")
+    print(f"        key   = {args.local_api_key}  (填它/随便填/不填都行，本代理忽略)")
+    print(f"        model = {REMOTE_MODEL or '(未指定，原样透传)'}"
+          "  (客户端随便填/不填，本代理自动替换)")
+    print(f"REMOTE  {REMOTE_URL}   (每次会话会变，客户端不用管)")
+    print("=" * 62)
     print(flush=True)  # stdout may be a log file; don't sit in the buffer
 
     try:
